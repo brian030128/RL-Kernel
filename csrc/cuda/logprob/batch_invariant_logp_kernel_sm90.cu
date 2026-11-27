@@ -5,6 +5,7 @@
 // logp[n] = logits[n, target[n]] - logsumexp(logits[n, :])
 
 #include "../utils/tma_utils.cuh"
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cub/cub.cuh>
 #include <cuda_bf16.h>
@@ -52,9 +53,9 @@ __global__ void batch_invariant_logp_sm90_kernel(const __grid_constant__ CUtenso
     const int row_idx = blockIdx.x;
 
     extern __shared__ __align__(1024) char smem[];
-    const int smem_addr = static_cast<int>(__cvta_generic_to_shared(smem));
+    const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
     T *smem_logits = reinterpret_cast<T *>(smem);
-    const int tma_mbar_addr = smem_addr + (SMEM_TILE * sizeof(T));
+    const uint32_t tma_mbar_addr = smem_addr + static_cast<uint32_t>(SMEM_TILE * sizeof(T));
 
     if (tid == 0) {
         mbarrier_init(tma_mbar_addr, 1);
@@ -81,8 +82,8 @@ __global__ void batch_invariant_logp_sm90_kernel(const __grid_constant__ CUtenso
             for (int j = 0; j < LOADS_PER_TILE; ++j) {
                 const int col = col_offset + j * TMA_BOX;
                 if (col < v_aligned) {
-                    tma_2d_g2s(smem_addr + j * TMA_BOX * sizeof(T), &logits_tmap, col, row_idx,
-                               tma_mbar_addr);
+                    tma_2d_g2s(smem_addr + static_cast<uint32_t>(j * TMA_BOX * sizeof(T)),
+                               &logits_tmap, col, row_idx, tma_mbar_addr);
                 }
             }
             mbarrier_arrive_expect_tx(tma_mbar_addr, current_tile_size * sizeof(T));
@@ -100,20 +101,28 @@ __global__ void batch_invariant_logp_sm90_kernel(const __grid_constant__ CUtenso
             s_tile_max = block_tile_max;
         __syncthreads();
 
-        // tile sum of exp(x - tile_max).
-        float tile_sum = 0.0f;
-        for (int i = tid; i < current_tile_size; i += NUM_THREADS) {
-            tile_sum += expf(to_float<T>(smem_logits[i]) - s_tile_max);
-        }
-        float block_tile_sum = BlockReduce(temp_storage).Reduce(tile_sum, DeterministicSum());
+        // tile sum of exp(x - tile_max); skip all--inf tiles to avoid -inf - (-inf) = NaN.
+        if (s_tile_max != -CUDART_INF_F) {
+            float tile_sum = 0.0f;
+            for (int i = tid; i < current_tile_size; i += NUM_THREADS) {
+                tile_sum += expf(to_float<T>(smem_logits[i]) - s_tile_max);
+            }
+            float block_tile_sum = BlockReduce(temp_storage).Reduce(tile_sum, DeterministicSum());
 
-        // Online log-sum-exp merge of this tile into the running row state.
-        if (tid == 0) {
-            const float new_max = max(row_max, s_tile_max);
-            row_sum = row_sum * expf(row_max - new_max) + block_tile_sum * expf(s_tile_max - new_max);
-            row_max = new_max;
+            // Online log-sum-exp merge of this tile into the running row state.
+            if (tid == 0) {
+                if (row_max == -CUDART_INF_F) {
+                    row_max = s_tile_max;
+                    row_sum = block_tile_sum;
+                } else {
+                    const float new_max = max(row_max, s_tile_max);
+                    row_sum = row_sum * expf(row_max - new_max) +
+                              block_tile_sum * expf(s_tile_max - new_max);
+                    row_max = new_max;
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     // Tail [v_aligned, V): fewer than TMA_BOX elements, read straight from global.
@@ -129,21 +138,29 @@ __global__ void batch_invariant_logp_sm90_kernel(const __grid_constant__ CUtenso
             s_tile_max = block_tail_max;
         __syncthreads();
 
-        float tail_sum = 0.0f;
-        for (int i = tid; i < tail; i += NUM_THREADS) {
-            tail_sum += expf(to_float<T>(logits_gmem[base + i]) - s_tile_max);
+        if (s_tile_max != -CUDART_INF_F) {
+            float tail_sum = 0.0f;
+            for (int i = tid; i < tail; i += NUM_THREADS) {
+                tail_sum += expf(to_float<T>(logits_gmem[base + i]) - s_tile_max);
+            }
+            float block_tail_sum = BlockReduce(temp_storage).Reduce(tail_sum, DeterministicSum());
+            if (tid == 0) {
+                if (row_max == -CUDART_INF_F) {
+                    row_max = s_tile_max;
+                    row_sum = block_tail_sum;
+                } else {
+                    const float new_max = max(row_max, s_tile_max);
+                    row_sum = row_sum * expf(row_max - new_max) +
+                              block_tail_sum * expf(s_tile_max - new_max);
+                    row_max = new_max;
+                }
+            }
+            __syncthreads();
         }
-        float block_tail_sum = BlockReduce(temp_storage).Reduce(tail_sum, DeterministicSum());
-        if (tid == 0) {
-            const float new_max = max(row_max, s_tile_max);
-            row_sum = row_sum * expf(row_max - new_max) + block_tail_sum * expf(s_tile_max - new_max);
-            row_max = new_max;
-        }
-        __syncthreads();
     }
 
     if (tid == 0) {
-        const float lse = row_max + logf(row_sum);
+        const float lse = (row_max == -CUDART_INF_F) ? -CUDART_INF_F : (row_max + logf(row_sum));
         const int tgt = target[row_idx];
         if (tgt == ignore_index) {
             output_logp[row_idx] = 0.0f;
@@ -166,7 +183,8 @@ void launch_batch_invariant_logp_sm90(torch::Tensor logits, torch::Tensor target
                        TMA_BOX);
 
     const int smem_size = (SMEM_TILE * sizeof(T)) + 16;
-    batch_invariant_logp_sm90_kernel<T, NUM_WARPS><<<N, NUM_WARPS * 32, smem_size>>>(
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    batch_invariant_logp_sm90_kernel<T, NUM_WARPS><<<N, NUM_WARPS * 32, smem_size, stream>>>(
         logits_tmap, target.data_ptr<int>(), reinterpret_cast<const T *>(logits.data_ptr<T>()),
         logp.data_ptr<float>(), lse.data_ptr<float>(), N, V, ignore_index);
 }
@@ -183,10 +201,12 @@ void launch_batch_invariant_logp_sm90_bf16(torch::Tensor logits, torch::Tensor t
         1, TMA_BOX);
 
     const int smem_size = (SMEM_TILE * sizeof(nv_bfloat16)) + 16;
-    batch_invariant_logp_sm90_kernel<nv_bfloat16, NUM_WARPS><<<N, NUM_WARPS * 32, smem_size>>>(
-        logits_tmap, target.data_ptr<int>(),
-        reinterpret_cast<const nv_bfloat16 *>(logits.data_ptr<at::BFloat16>()),
-        logp.data_ptr<float>(), lse.data_ptr<float>(), N, V, ignore_index);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    batch_invariant_logp_sm90_kernel<nv_bfloat16, NUM_WARPS>
+        <<<N, NUM_WARPS * 32, smem_size, stream>>>(
+            logits_tmap, target.data_ptr<int>(),
+            reinterpret_cast<const nv_bfloat16 *>(logits.data_ptr<at::BFloat16>()),
+            logp.data_ptr<float>(), lse.data_ptr<float>(), N, V, ignore_index);
 }
 
 } // namespace
@@ -215,6 +235,9 @@ std::vector<torch::Tensor> batch_invariant_logp_sm90_forward(torch::Tensor logit
     auto opts_f = logits.options().dtype(torch::kFloat);
     auto logp = torch::empty({N}, opts_f);
     auto lse = torch::empty({N}, opts_f);
+    if (N == 0) {
+        return {logp, lse};
+    }
     auto target_i = target.to(torch::kInt32).contiguous();
 
     if (logits.scalar_type() == at::kBFloat16) {
