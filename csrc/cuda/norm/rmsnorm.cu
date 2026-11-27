@@ -65,7 +65,7 @@ __device__ __forceinline__ float block_reduce_sum(float v) {
 }
 
 
-static int choose_threads(int H) {
+static int choose_threads(int64_t H) {
     if (H <= 64) return 64;
     if (H <= 128) return 128;
     if (H <= 256) return 256;
@@ -108,20 +108,21 @@ __global__ void rmsnorm_fwd_kernel(
     const weight_t* __restrict__ weight,
     scalar_t* __restrict__ y,
     float* __restrict__ rstd,
-    int T,
-    int H,
+    int64_t T,
+    int64_t H,
     float eps
 ) {
-    int row = blockIdx.x;
+    int64_t row = static_cast<int64_t>(blockIdx.x);
     int tid = threadIdx.x;
+    const int64_t row_offset = row * H;
 
-    const scalar_t* x_row = x + row * H;
-    scalar_t* y_row = y + row * H;
+    const scalar_t* x_row = x + row_offset;
+    scalar_t* y_row = y + row_offset;
 
     float local_sum = 0.0f;
 
     // Compute sum(x^2), with each thread handling a subset of columns.
-    for (int col = tid; col < H; col += blockDim.x) {
+    for (int64_t col = tid; col < H; col += blockDim.x) {
         float xv = load_as_float<scalar_t>(x_row + col);
         local_sum += xv * xv;
     }
@@ -138,7 +139,7 @@ __global__ void rmsnorm_fwd_kernel(
     __syncthreads();
 
     // Write y = x * rstd * weight.
-    for (int col = tid; col < H; col += blockDim.x) {
+    for (int64_t col = tid; col < H; col += blockDim.x) {
         float xv = load_as_float<scalar_t>(x_row + col);
         float wv = load_as_float<weight_t>(weight + col);
         float out = xv * row_rstd * wv;
@@ -154,19 +155,20 @@ __global__ void rmsnorm_bwd_dx_kernel(
     const weight_t* __restrict__ weight,
     const float* __restrict__ rstd,
     scalar_t* __restrict__ dx,
-    int T,
-    int H
+    int64_t T,
+    int64_t H
 ) {
-    int row = blockIdx.x;
+    int64_t row = static_cast<int64_t>(blockIdx.x);
     int tid = threadIdx.x;
+    const int64_t row_offset = row * H;
 
-    const scalar_t* dy_row = dy + row * H;
-    const scalar_t* x_row = x + row * H;
-    scalar_t* dx_row = dx + row * H;
+    const scalar_t* dy_row = dy + row_offset;
+    const scalar_t* x_row = x + row_offset;
+    scalar_t* dx_row = dx + row_offset;
 
     float local_dot = 0.0f;
 
-    for (int col = tid; col < H; col += blockDim.x) {
+    for (int64_t col = tid; col < H; col += blockDim.x) {
         float dyv = load_as_float<scalar_t>(dy_row + col);
         float xv = load_as_float<scalar_t>(x_row + col);
         float wv = load_as_float<weight_t>(weight + col);
@@ -178,7 +180,7 @@ __global__ void rmsnorm_bwd_dx_kernel(
     float r = rstd[row];
     float coeff = dot * r * r * r / static_cast<float>(H);
 
-    for (int col = tid; col < H; col += blockDim.x) {
+    for (int64_t col = tid; col < H; col += blockDim.x) {
         float dyv = load_as_float<scalar_t>(dy_row + col);
         float xv = load_as_float<scalar_t>(x_row + col);
         float wv = load_as_float<weight_t>(weight + col);
@@ -196,24 +198,24 @@ __global__ void rmsnorm_partial_dw_kernel(
     const float* __restrict__ rstd,
     const bool* __restrict__ mask,
     float* __restrict__ partial_dw,
-    int T,
-    int H
+    int64_t T,
+    int64_t H
 ) {
-    int chunk = blockIdx.x;
-    int h = blockIdx.y * RMSNORM_DW_H_TILE + threadIdx.x;
+    int64_t chunk = static_cast<int64_t>(blockIdx.x);
+    int64_t h = static_cast<int64_t>(blockIdx.y) * RMSNORM_DW_H_TILE + threadIdx.x;
     if (h >= H) {
         return;
     }
 
-    int t0 = chunk * RMSNORM_DW_ROWS_PER_CHUNK;
+    int64_t t0 = chunk * RMSNORM_DW_ROWS_PER_CHUNK;
     float acc = 0.0f;
 
 #pragma unroll
     for (int i = 0; i < RMSNORM_DW_ROWS_PER_CHUNK; ++i) {
-        int row = t0 + i;
+        int64_t row = t0 + i;
         float contrib = 0.0f;
         if (row < T && mask[row]) {
-            int idx = row * H + h;
+            int64_t idx = row * H + h;
             float dyv = load_as_float<scalar_t>(dy + idx);
             float xv = load_as_float<scalar_t>(x + idx);
             contrib = dyv * xv * rstd[row];
@@ -228,16 +230,16 @@ __global__ void rmsnorm_partial_dw_kernel(
 __global__ void rmsnorm_reduce_dw_kernel(
     const float* __restrict__ partial_dw,
     float* __restrict__ dw,
-    int chunks,
-    int H
+    int64_t chunks,
+    int64_t H
 ) {
-    int h = blockIdx.x * RMSNORM_DW_H_TILE + threadIdx.x;
+    int64_t h = static_cast<int64_t>(blockIdx.x) * RMSNORM_DW_H_TILE + threadIdx.x;
     if (h >= H) {
         return;
     }
 
     float acc = 0.0f;
-    for (int chunk = 0; chunk < chunks; ++chunk) {
+    for (int64_t chunk = 0; chunk < chunks; ++chunk) {
         acc += partial_dw[chunk * H + h];
     }
     dw[h] = acc;
@@ -251,8 +253,14 @@ void rmsnorm_forward_cuda(
     torch::Tensor rstd,
     double eps
 ) {
-    int T = x.size(0);
-    int H = x.size(1);
+#if !defined(USE_ROCM)
+    const c10::cuda::CUDAGuard device_guard(x.device());
+#endif
+    int64_t T = x.size(0);
+    int64_t H = x.size(1);
+    if (T == 0 || H == 0) {
+        return;
+    }
     int threads = choose_threads(H);
     size_t smem = threads * sizeof(float);
 
@@ -273,6 +281,9 @@ void rmsnorm_forward_cuda(
             );
         });
     });
+#if !defined(USE_ROCM)
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 
 
@@ -283,8 +294,14 @@ void rmsnorm_backward_dx_cuda(
     torch::Tensor rstd,
     torch::Tensor dx
 ) {
-    int T = x.size(0);
-    int H = x.size(1);
+#if !defined(USE_ROCM)
+    const c10::cuda::CUDAGuard device_guard(x.device());
+#endif
+    int64_t T = x.size(0);
+    int64_t H = x.size(1);
+    if (T == 0 || H == 0) {
+        return;
+    }
     int threads = choose_threads(H);
     size_t smem = threads * sizeof(float);
 
@@ -305,6 +322,9 @@ void rmsnorm_backward_dx_cuda(
             );
         });
     });
+#if !defined(USE_ROCM)
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 
 
@@ -315,10 +335,16 @@ void rmsnorm_backward_partial_dw_cuda(
     torch::Tensor mask,
     torch::Tensor partial_dw
 ) {
-    int T = x.size(0);
-    int H = x.size(1);
+#if !defined(USE_ROCM)
+    const c10::cuda::CUDAGuard device_guard(x.device());
+#endif
+    int64_t T = x.size(0);
+    int64_t H = x.size(1);
+    if (T == 0 || H == 0) {
+        return;
+    }
 
-    int chunks = (T + RMSNORM_DW_ROWS_PER_CHUNK - 1) / RMSNORM_DW_ROWS_PER_CHUNK;
+    int64_t chunks = (T + RMSNORM_DW_ROWS_PER_CHUNK - 1) / RMSNORM_DW_ROWS_PER_CHUNK;
     dim3 blocks(chunks, (H + RMSNORM_DW_H_TILE - 1) / RMSNORM_DW_H_TILE);
     dim3 threads(RMSNORM_DW_H_TILE);
 
@@ -335,6 +361,9 @@ void rmsnorm_backward_partial_dw_cuda(
             H
         );
     });
+#if !defined(USE_ROCM)
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 
 
@@ -342,8 +371,14 @@ void rmsnorm_backward_reduce_dw_cuda(
     torch::Tensor partial_dw,
     torch::Tensor dw
 ) {
-    int chunks = partial_dw.size(0);
-    int H = partial_dw.size(1);
+#if !defined(USE_ROCM)
+    const c10::cuda::CUDAGuard device_guard(partial_dw.device());
+#endif
+    int64_t chunks = partial_dw.size(0);
+    int64_t H = partial_dw.size(1);
+    if (H == 0) {
+        return;
+    }
 
     dim3 blocks((H + RMSNORM_DW_H_TILE - 1) / RMSNORM_DW_H_TILE);
     dim3 threads(RMSNORM_DW_H_TILE);
@@ -356,6 +391,9 @@ void rmsnorm_backward_reduce_dw_cuda(
         chunks,
         H
     );
+#if !defined(USE_ROCM)
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 
 #if !defined(USE_ROCM)
@@ -365,6 +403,9 @@ void reduce_rows_fp32_left_fold_cuda(
 ) {
     const c10::cuda::CUDAGuard device_guard(rows.device());
     int64_t columns = rows.size(1);
+    if (columns == 0) {
+        return;
+    }
     int64_t blocks = (columns + FP32_LEFT_FOLD_THREADS - 1) / FP32_LEFT_FOLD_THREADS;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
