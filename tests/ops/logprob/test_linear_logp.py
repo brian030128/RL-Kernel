@@ -1707,3 +1707,79 @@ def test_triton_det_tp_matches_single_rank_and_replicates(world_size):
     # Outputs are replicated: every rank holds identical bits.
     for other in results[1:]:
         assert results[0]["logp_bits"] == other["logp_bits"]
+
+
+def _sm90_fused_linear_logp_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        from rl_engine.backends.extension import _C, _EXT_AVAILABLE
+    except Exception:
+        return False
+    return (
+        _EXT_AVAILABLE
+        and hasattr(_C, "fused_linear_logp_sm90")
+        and hasattr(_C, "fused_linear_logp_sm90_global_target")
+        and torch.cuda.get_device_capability()[0] == 9
+    )
+
+
+@pytest.mark.skipif(
+    not _sm90_fused_linear_logp_available(),
+    reason="fused_linear_logp_sm90 requires Hopper GPU and KERNEL_ALIGN_FORCE_SM90=1",
+)
+def test_sm90_fused_linear_logp_cuda_graph_capture_uses_current_stream():
+    """fused_linear_logp_sm90 must launch on at::cuda::getCurrentCUDAStream(), not stream 0."""
+    from rl_engine.backends.extension import _C
+
+    torch.manual_seed(31)
+    n, d, v = 8, 128, 512
+    hidden = torch.randn((n, d), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((v, d), device="cuda", dtype=torch.bfloat16) * 0.1
+    target = torch.randint(0, v, (n,), device="cuda", dtype=torch.int32)
+
+    side_stream = torch.cuda.Stream()
+    with torch.cuda.stream(side_stream):
+        warm_logp, _ = _C.fused_linear_logp_sm90(hidden, weight, target)
+    side_stream.synchronize()
+    ref0_logits = torch.nn.functional.linear(hidden.float(), weight.float())
+    ref0_logp = torch.log_softmax(ref0_logits, dim=-1).gather(1, target.long()[:, None]).squeeze(1)
+    torch.testing.assert_close(warm_logp, ref0_logp, atol=2e-2, rtol=2e-2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side_stream):
+        out_logp, out_lse = _C.fused_linear_logp_sm90(hidden, weight, target)
+
+    new_hidden = torch.randn_like(hidden)
+    hidden.copy_(new_hidden)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    ref1_logits = torch.nn.functional.linear(new_hidden.float(), weight.float())
+    ref1_lse = torch.logsumexp(ref1_logits, dim=-1)
+    ref1_logp = ref1_logits.gather(1, target.long()[:, None]).squeeze(1) - ref1_lse
+    torch.testing.assert_close(out_logp, ref1_logp, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out_lse, ref1_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not _sm90_fused_linear_logp_available(),
+    reason="fused_linear_logp_sm90 requires Hopper GPU and KERNEL_ALIGN_FORCE_SM90=1",
+)
+def test_sm90_fused_linear_logp_all_masked_tp_shard_returns_neg_inf_not_nan():
+    """An all-padded TP vocab shard (vocab_start_index >= real_vocab_size) must return lse=-inf."""
+    from rl_engine.backends.extension import _C
+
+    torch.manual_seed(32)
+    n, d, v = 8, 128, 256
+    hidden = torch.randn((n, d), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((v, d), device="cuda", dtype=torch.bfloat16) * 0.1
+    target = torch.randint(0, 128, (n,), device="cuda", dtype=torch.int32)
+
+    local_zt, local_lse = _C.fused_linear_logp_sm90_global_target(
+        hidden, weight, target, None, 256, None, 256
+    )
+    torch.cuda.synchronize()
+    assert not torch.isnan(local_lse).any(), f"Expected -inf LSE for padded shard, got {local_lse}"
+    assert torch.isneginf(local_lse).all(), f"Expected -inf LSE for padded shard, got {local_lse}"
+    assert torch.equal(local_zt, torch.zeros_like(local_zt))

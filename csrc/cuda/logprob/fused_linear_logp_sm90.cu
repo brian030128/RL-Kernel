@@ -502,14 +502,22 @@ __global__ void fused_linear_logp_sm90_combine_kernel(const float *__restrict__ 
 
     float S = 0.0f;
     float zt = 0.0f;
-    for (int s = 0; s < n_split; ++s) {  // ascending-index sequential chain
-        const int idx = s * N + r;
-        S += part_sum[idx] * expf(part_max[idx] - M);
-        zt += part_zt[idx];
+    if (M != -CUDART_INF_F) {
+        for (int s = 0; s < n_split; ++s) {  // ascending-index sequential chain
+            const int idx = s * N + r;
+            const float pm = part_max[idx];
+            if (pm != -CUDART_INF_F) {
+                S += part_sum[idx] * expf(pm - M);
+            }
+            zt += part_zt[idx];
+        }
+        const float lse = M + logf(S);
+        out_value[r] = return_target_logit ? zt : fminf(zt - lse, 0.0f);
+        out_lse[r] = lse;
+    } else {
+        out_value[r] = return_target_logit ? 0.0f : -CUDART_INF_F;
+        out_lse[r] = -CUDART_INF_F;
     }
-    const float lse = M + logf(S);
-    out_value[r] = return_target_logit ? zt : fminf(zt - lse, 0.0f);
-    out_lse[r] = lse;
 }
 
 __global__ void fused_linear_logp_backward_dlogits_kernel(float *__restrict__ logits,
@@ -2042,6 +2050,7 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
     torch::optional<torch::Tensor> bias, int64_t vocab_start_index, bool return_target_logit,
     torch::optional<torch::Tensor> temperature, bool return_logits, int64_t real_vocab_size) {
     TORCH_CHECK(hidden.is_cuda() && weight.is_cuda(), "hidden and weight must be CUDA tensors");
+    const c10::cuda::CUDAGuard device_guard(hidden.device());
     TORCH_CHECK(weight.device() == hidden.device(),
                 "lm_head_weight must be on the same device as hidden");
     TORCH_CHECK(hidden.scalar_type() == at::kBFloat16, "hidden must be bfloat16");
@@ -2132,15 +2141,16 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     }
 
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     dim3 grid(row_blocks, n_split);
-    fused_linear_logp_sm90_kernel<<<grid, WG_THREADS, smem>>>(
+    fused_linear_logp_sm90_kernel<<<grid, WG_THREADS, smem, stream>>>(
         h_tmap, w_tmap, target_i.data_ptr<int>(), bias_ptr, temp_ptr, logits_ptr,
         part_max.data_ptr<float>(), part_sum.data_ptr<float>(), part_zt.data_ptr<float>(), N, D,
         V, n_split, static_cast<int>(vocab_start_index), real_vocab_end);
 
     const int combine_threads = 256;
     const int combine_blocks = (N + combine_threads - 1) / combine_threads;
-    fused_linear_logp_sm90_combine_kernel<<<combine_blocks, combine_threads>>>(
+    fused_linear_logp_sm90_combine_kernel<<<combine_blocks, combine_threads, 0, stream>>>(
         part_max.data_ptr<float>(), part_sum.data_ptr<float>(), part_zt.data_ptr<float>(),
         out_value.data_ptr<float>(), lse.data_ptr<float>(), N, n_split, return_target_logit);
 
