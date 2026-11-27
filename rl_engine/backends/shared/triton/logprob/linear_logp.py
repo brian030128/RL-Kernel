@@ -85,7 +85,10 @@ def _linear_logp_fwd_kernel(
 
         tile_max = tl.max(acc, axis=1)
         new_m = tl.maximum(m, tile_max)
-        s = s * tl.exp(m - new_m) + tl.sum(tl.exp(acc - new_m[:, None]), axis=1)
+        finite = new_m != float("-inf")
+        alpha = tl.where(finite, tl.exp(m - new_m), 1.0)
+        probs = tl.where(finite[:, None], tl.exp(acc - new_m[:, None]), 0.0)
+        s = s * alpha + tl.sum(probs, axis=1)
         m = new_m
 
     lse = m + tl.log(s)

@@ -85,7 +85,10 @@ def _batch_invariant_logp_kernel(
 
         tile_max = tl.max(tile)
         new_m = tl.maximum(m, tile_max)
-        s = s * tl.exp(m - new_m) + tl.sum(tl.exp(tile - new_m))
+        finite = new_m != float("-inf")
+        alpha = tl.where(finite, tl.exp(m - new_m), 1.0)
+        probs = tl.where(finite, tl.exp(tile - new_m), 0.0)
+        s = s * alpha + tl.sum(probs)
         m = new_m
 
     lse = m + tl.log(s)

@@ -51,12 +51,18 @@ def _ratio_kl_fwd_kernel(
 
             tmax_p = tl.max(p, axis=0)
             nmax_p = tl.maximum(max_p, tmax_p)
-            sum_p = sum_p * tl.exp(max_p - nmax_p) + tl.sum(tl.exp(p - nmax_p), axis=0)
+            finite_p = nmax_p != -float("inf")
+            sum_p = sum_p * tl.where(finite_p, tl.exp(max_p - nmax_p), 1.0) + tl.sum(
+                tl.where(finite_p, tl.exp(p - nmax_p), 0.0), axis=0
+            )
             max_p = nmax_p
 
             tmax_r = tl.max(r, axis=0)
             nmax_r = tl.maximum(max_r, tmax_r)
-            sum_r = sum_r * tl.exp(max_r - nmax_r) + tl.sum(tl.exp(r - nmax_r), axis=0)
+            finite_r = nmax_r != -float("inf")
+            sum_r = sum_r * tl.where(finite_r, tl.exp(max_r - nmax_r), 1.0) + tl.sum(
+                tl.where(finite_r, tl.exp(r - nmax_r), 0.0), axis=0
+            )
             max_r = nmax_r
 
         logz_p = max_p + tl.log(sum_p)
@@ -110,8 +116,10 @@ def _ratio_kl_bwd_kernel(
         g_kl = tl.load(grad_kl_ptr + row)
 
         # d(ratio)/d(logp_p) = ratio ; d(kl)/d(logp_p) = 1 - exp(d).
-        # Both chain through (1[v==a] - softmax_policy(v)).
-        c = g_ratio * ratio + g_kl * (1.0 - tl.exp(d))
+        # Guard zero upstream grads so 0.0 * (+/-inf) never produces NaN.
+        ratio_term = tl.where(g_ratio != 0.0, g_ratio * ratio, 0.0)
+        kl_term = tl.where(g_kl != 0.0, g_kl * (1.0 - tl.exp(d)), 0.0)
+        c = ratio_term + kl_term
 
         for start in range(0, V, BLOCK_V):
             cols = start + tl.arange(0, BLOCK_V)

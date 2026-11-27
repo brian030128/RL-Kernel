@@ -681,6 +681,47 @@ def test_triton_handles_oob_action_ids():
     assert torch.allclose(k_t[active], k_n[active], atol=1e-4, rtol=1e-4)
 
 
+@requires_triton_cuda
+def test_triton_ratio_kl_all_neg_inf_leading_tile_no_nan():
+    """All--inf leading vocab tile (BLOCK_V=2048) must not produce NaN in online softmax."""
+    fused = TritonRatioKLOp()
+    pol = torch.full((1, 4096), float("-inf"), device="cuda", dtype=torch.float32)
+    pol[0, 3000:3010] = 0.0
+    ref = pol.clone()
+    act = torch.tensor([3000], device="cuda", dtype=torch.long)
+    mask = torch.tensor([True], device="cuda")
+    old = torch.tensor([-2.302585], device="cuda", dtype=torch.float32)
+
+    ratio, kl = fused(pol, ref, act, mask, old)
+    assert torch.isfinite(ratio).all(), f"Expected finite ratio, got {ratio}"
+    assert torch.isfinite(kl).all(), f"Expected finite kl, got {kl}"
+    torch.testing.assert_close(ratio, torch.ones_like(ratio), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(kl, torch.zeros_like(kl), atol=1e-4, rtol=1e-4)
+
+
+@requires_triton_cuda
+def test_triton_ratio_kl_backward_zero_grad_kl_large_diff_no_nan():
+    """Differentiating only ratio (g_kl=0) with large d=logp_ref-logp_pol must not yield NaN."""
+    fused = TritonRatioKLOp()
+    native = NativeRatioKLOp()
+
+    pol_t = torch.tensor([[0.0, 100.0]], device="cuda", dtype=torch.float32, requires_grad=True)
+    ref = torch.tensor([[0.0, 0.0]], device="cuda", dtype=torch.float32)
+    act = torch.tensor([0], device="cuda", dtype=torch.long)
+    mask = torch.tensor([True], device="cuda")
+    old = torch.tensor([-100.0], device="cuda", dtype=torch.float32)
+
+    ratio_t, _ = fused(pol_t, ref, act, mask, old)
+    ratio_t.sum().backward()
+
+    pol_n = pol_t.detach().clone().requires_grad_(True)
+    ratio_n, _ = native(pol_n, ref, act, mask, old)
+    ratio_n.sum().backward()
+
+    assert torch.isfinite(pol_t.grad).all(), f"Expected finite grad, got {pol_t.grad}"
+    torch.testing.assert_close(pol_t.grad, pol_n.grad, atol=1e-4, rtol=1e-4)
+
+
 # Registry dispatch (device-dependent backend selection)
 def test_registry_dispatches_ratio_kl():
     from rl_engine.runtime.registry import kernel_registry
