@@ -8,6 +8,12 @@ The PyTorch path (torch.matmul) is intentionally NOT tested here: it is the
 non-deterministic reference baseline and would fail batch-invariance by design.
 """
 
+import re
+import shutil
+import subprocess
+import sysconfig
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -738,3 +744,99 @@ def test_triton_wgrad_reads_positive_stride_transpose_view_raw_bytes():
 
     assert direct is output_buffer
     _assert_same_raw_bytes(direct, legacy)
+
+
+@pytest.mark.skipif(IS_ROCM, reason="CUDA det_gemm extension regression test")
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (0, 128, 64),
+        (128, 0, 64),
+        (128, 128, 0),
+        (0, 0, 0),
+    ],
+)
+def test_cuda_det_gemm_zero_dim_inputs(shape):
+    """Zero-dim inputs must not pass 0 to cuTensorMapEncodeTiled or launch 0-grid kernels."""
+    M, K, N = shape
+    a = torch.empty((M, K), device=DEV, dtype=torch.bfloat16)
+    b = torch.empty((K, N), device=DEV, dtype=torch.bfloat16)
+    bt = torch.empty((N, K), device=DEV, dtype=torch.bfloat16)
+    dc = torch.empty((M, N), device=DEV, dtype=torch.bfloat16)
+
+    out_fwd = _C.det_gemm_fwd(a, b)
+    out_rhs_t = _C.det_gemm_fwd_rhs_transposed(a, bt)
+    out_da = _C.det_gemm_da(dc, b)
+    out_db_t = _C.det_gemm_db_transposed(a, dc)
+    torch.cuda.synchronize()
+
+    assert tuple(out_fwd.shape) == (M, N)
+    assert out_fwd.dtype == torch.bfloat16
+    assert tuple(out_rhs_t.shape) == (M, N)
+    assert out_rhs_t.dtype == torch.bfloat16
+    assert tuple(out_da.shape) == (M, K)
+    assert out_da.dtype == torch.bfloat16
+    assert tuple(out_db_t.shape) == (N, K)
+    assert out_db_t.dtype == torch.bfloat16
+
+    if K == 0 and M > 0 and N > 0:
+        expected_zero = torch.zeros((M, N), device=DEV, dtype=torch.bfloat16)
+        assert torch.equal(out_fwd, expected_zero)
+        assert torch.equal(out_rhs_t, expected_zero)
+    if M == 0 and N > 0 and K > 0:
+        expected_zero = torch.zeros((N, K), device=DEV, dtype=torch.bfloat16)
+        assert torch.equal(out_db_t, expected_zero)
+
+
+@pytest.mark.skipif(IS_ROCM, reason="CUDA SM90 PTX regression test")
+def test_det_gemm_sm90_mbar_and_phase_do_not_spill_to_local(tmp_path):
+    """mbar and phase must live in registers, never spilling to .local inside the K-loop."""
+    nvcc = shutil.which("nvcc")
+    if nvcc is None:
+        pytest.skip("nvcc is required for SM90 PTX spill regression check")
+    src = Path(__file__).resolve().parents[3] / "csrc/cuda/gemm/det_gemm_kernel.cu"
+    if not src.exists():
+        pytest.skip(f"{src} not found")
+
+    from torch.utils.cpp_extension import include_paths
+
+    ptx_path = tmp_path / "det_gemm_kernel.ptx"
+    cmd = [
+        nvcc,
+        "-ptx",
+        "-O3",
+        "-std=c++17",
+        "-arch=sm_90a",
+        "-DRL_KERNEL_ENABLE_SM90",
+        *[f"-I{inc}" for inc in include_paths(device_type="cuda")],
+        f"-I{sysconfig.get_path('include')}",
+        str(src),
+        "-o",
+        str(ptx_path),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if res.returncode != 0:
+        pytest.skip(f"nvcc -ptx sm_90a unavailable: {res.stderr[:300]}")
+
+    ptx = ptx_path.read_text(encoding="utf-8")
+    # Inspect every det_gemm_sm90_kernel instantiation (internal-linkage .entry
+    # inside anonymous namespace): tree_stk uses .v4/.b64 stores only; mbar[2]
+    # and phase[2] spilled via st.local.v2.u32 / st.local.u32.
+    matches = list(
+        re.finditer(
+            r"\.entry\s+([^\(\s]*det_gemm_sm90_kernel[^\(\s]*)\(.*?\n\}",
+            ptx,
+            flags=re.S,
+        )
+    )
+    assert matches, "expected at least one det_gemm_sm90_kernel entry in PTX"
+    for match in matches:
+        name, body = match.group(1), match.group(0)
+        non_tree_stores = [
+            line.strip()
+            for line in body.splitlines()
+            if "st.local" in line and ".v4." not in line and ".b64" not in line
+        ]
+        assert non_tree_stores == [], (
+            f"{name} spilled non-tree_stk state (mbar/phase) to .local: {non_tree_stores}"
+        )

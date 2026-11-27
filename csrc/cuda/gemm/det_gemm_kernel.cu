@@ -233,6 +233,7 @@ void launch_db_small_k(const nv_bf16* X,
                        int in_features,
                        int out_features,
                        cudaStream_t stream) {
+  if (tokens <= 0 || in_features <= 0 || out_features <= 0) return;
   dim3 block(SMALL_THREADS);
   dim3 grid(cdiv(in_features, SMALL_N_TILE), cdiv(out_features, SMALL_M_TILE));
   constexpr int smem_elements = SMALL_K_TILE * (SMALL_N_TILE + SMALL_M_TILE);
@@ -243,6 +244,7 @@ void launch_db_small_k(const nv_bf16* X,
 template <typename output_t, bool TRANSPOSE_OUTPUT>
 void launch_naive(const nv_bf16* A, const nv_bf16* B, output_t* C,
                   int M, int N, int K, cudaStream_t stream) {
+  if (M <= 0 || N <= 0) return;
   dim3 block(NAIVE_TILE, NAIVE_TILE);
   dim3 grid(cdiv(N, NAIVE_TILE), cdiv(M, NAIVE_TILE));
   det_gemm_naive<output_t, TRANSPOSE_OUTPUT><<<grid, block, 0, stream>>>(
@@ -317,16 +319,15 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   nv_bf16* sB = reinterpret_cast<nv_bf16*>(sA + STAGES * BM * BK);
   int* mbar_base = reinterpret_cast<int*>(sB + STAGES * BN * BK);
 
+  static_assert(STAGES == 2, "SM90 double-buffered pipeline requires STAGES == 2");
   const uint32_t sA_base = static_cast<uint32_t>(__cvta_generic_to_shared(sA));
   const uint32_t sB_base = static_cast<uint32_t>(__cvta_generic_to_shared(sB));
-  uint32_t mbar[STAGES];
-#pragma unroll
-  for (int s = 0; s < STAGES; ++s)
-    mbar[s] = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_base + 2 * s));
+  const uint32_t mbar0 = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_base));
+  const uint32_t mbar1 = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_base + 2));
 
   if (tid == 0) {
-#pragma unroll
-    for (int s = 0; s < STAGES; ++s) det_gemm::mbar_init(mbar[s], 1);
+    det_gemm::mbar_init(mbar0, 1);
+    det_gemm::mbar_init(mbar1, 1);
     asm volatile("fence.mbarrier_init.release.cluster;");
   }
   __syncthreads();
@@ -334,32 +335,34 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   const uint32_t tile_bytes = (BM * BK + BN * BK) * sizeof(nv_bf16);
 
   auto issue_load = [&](int k) {
-    const int buf = k % STAGES;
+    const int buf = k & 1;
+    const uint32_t mbar_cur = buf == 0 ? mbar0 : mbar1;
     const int koff = k * BK;
-    det_gemm::tma_2d_g2s(sA_base + buf * BM * BK * sizeof(nv_bf16), &a_tmap, koff, row_base, mbar[buf]);
-    det_gemm::tma_2d_g2s(sB_base + buf * BN * BK * sizeof(nv_bf16), &bt_tmap, koff, col_base, mbar[buf]);
-    det_gemm::mbar_arrive_expect_tx(mbar[buf], tile_bytes);
+    det_gemm::tma_2d_g2s(sA_base + buf * BM * BK * sizeof(nv_bf16), &a_tmap, koff, row_base, mbar_cur);
+    det_gemm::tma_2d_g2s(sB_base + buf * BN * BK * sizeof(nv_bf16), &bt_tmap, koff, col_base, mbar_cur);
+    det_gemm::mbar_arrive_expect_tx(mbar_cur, tile_bytes);
   };
 
-  int phase[STAGES];
-#pragma unroll
-  for (int s = 0; s < STAGES; ++s) phase[s] = 0;
+  int phase0 = 0;
+  int phase1 = 0;
 
   float tile_acc[M_TILES][N_TILES][4];
   __nv_bfloat162 tree_v[M_TILES][N_TILES][2];
   __nv_bfloat162 tree_stk[TREE_DEPTH][M_TILES][N_TILES][2];
   int sp = 0;
 
-  if (tid == 0)
-#pragma unroll
-    for (int s = 0; s < STAGES - 1; ++s)
-      if (s < kd) issue_load(s);
+  if (tid == 0 && kd > 0) issue_load(0);
 
   for (int k = 0; k < kd; ++k) {       // fixed ascending tile order, NO split-K
-    const int buf = k % STAGES;
+    const int buf = k & 1;
+    const uint32_t mbar_cur = buf == 0 ? mbar0 : mbar1;
+    const int phase_cur = buf == 0 ? phase0 : phase1;
     if (tid == 0 && k + (STAGES - 1) < kd) issue_load(k + (STAGES - 1));
-    if (tid == 0) det_gemm::mbar_wait(mbar[buf], phase[buf]);
-    phase[buf] ^= 1;
+    if (tid == 0) det_gemm::mbar_wait(mbar_cur, phase_cur);
+    if (buf == 0)
+      phase0 ^= 1;
+    else
+      phase1 ^= 1;
     __syncthreads();
 
     const uint32_t sA_buf = sA_base + buf * BM * BK * sizeof(nv_bf16);
@@ -458,6 +461,7 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
 template <typename output_t, bool TRANSPOSE_OUTPUT>
 bool launch_sm90(const nv_bf16* A, const nv_bf16* Bt, output_t* C,
                  int M, int N, int K, cudaStream_t stream) {
+  if (M <= 0 || N <= 0 || K <= 0) return false;
   if (M % BM != 0 || N % BN != 0 || K % BK != 0) return false;  // fall back
   if (K / BK > (1 << TREE_DEPTH)) return false;
 
@@ -502,6 +506,7 @@ torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& rhs,
   const bool transpose_output = output_layout == OutputLayout::kNM;
   auto options = a.options().dtype(output_fp32 ? torch::kFloat32 : torch::kBFloat16);
   auto c = transpose_output ? torch::empty({N, M}, options) : torch::empty({M, N}, options);
+  if (M == 0 || N == 0) return c;
   auto stream = at::cuda::getCurrentCUDAStream();
 
 #if defined(RL_KERNEL_ENABLE_SM90)
@@ -509,7 +514,7 @@ torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& rhs,
   // BM so that EVERY M (including M=1 and non-aligned M) takes the SAME kernel.
   // Selecting a different kernel based on M would itself break batch-invariance
   // because M is the batch dimension.
-  if (sm_major() >= 9 && K % BK == 0 && N % BN == 0) {
+  if (sm_major() >= 9 && K > 0 && K % BK == 0 && N % BN == 0) {
     const int Mp = cdiv(M, BM) * BM;
     torch::Tensor a_use = a;
     if (Mp != M) {
