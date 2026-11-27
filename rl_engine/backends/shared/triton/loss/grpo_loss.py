@@ -46,9 +46,10 @@ def _group_norm_kernel(
 
     count = (end - start).to(tl.float32)
     mean = tl.sum(rewards, axis=0) / count
-    # Population variance (unbiased=False): E[x^2] - E[x]^2. Masked lanes are 0.
-    sq_mean = tl.sum(rewards * rewards, axis=0) / count
-    std = tl.sqrt(tl.maximum(sq_mean - mean * mean, 0.0))
+    # Centered two-pass variance in registers avoids catastrophic cancellation in E[x^2] - E[x]^2.
+    centered = tl.where(keep, rewards - mean, 0.0)
+    var = tl.sum(centered * centered, axis=0) / count
+    std = tl.sqrt(tl.maximum(var, 0.0))
     std = tl.maximum(std, eps)
 
     adv = (rewards - mean) / std
@@ -124,7 +125,7 @@ class TritonGRPOLossOp:
             )
             return bounds, samples_per_prompt
 
-        bounds = torch.as_tensor(group_boundaries, device=device, dtype=torch.int32)
+        bounds = torch.as_tensor(group_boundaries, device=device, dtype=torch.int32).contiguous()
         if bounds.ndim != 1 or bounds.numel() < 2:
             raise ValueError("group_boundaries must be a 1D tensor of length num_groups + 1.")
         sizes = bounds[1:] - bounds[:-1]
@@ -149,7 +150,7 @@ class TritonGRPOLossOp:
             raise RuntimeError(
                 "TritonGRPOLossOp requires accelerator tensors " "(CUDA / ROCm / XPU / MUSA)."
             )
-        flat = rewards.reshape(-1).to(torch.float32)
+        flat = rewards.reshape(-1).to(torch.float32).contiguous()
         n = flat.numel()
         bounds, max_group = self._build_bounds(n, flat.device, samples_per_prompt, group_boundaries)
         num_groups = bounds.numel() - 1

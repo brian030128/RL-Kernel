@@ -877,6 +877,19 @@ class TestTritonValidation:
         with pytest.raises(ValueError, match="outside"):
             op(logits, target, validate=True)
 
+    def test_all_neg_inf_leading_tile_no_nan(self):
+        """All--inf leading vocab tile (BLOCK_V=1024) must not produce -inf - (-inf) = NaN."""
+        op = self._get_op()
+        logits = torch.full((2, 2048), float("-inf"), device="cuda", dtype=torch.float32)
+        logits[0, 1500:1510] = 0.0
+        logits[1, :10] = 1.0
+        target = torch.tensor([1500, 3], device="cuda", dtype=torch.long)
+
+        out = op(logits, target)
+        ref = _reference_logp(logits, target)
+        assert torch.isfinite(out).all(), f"Expected finite logp for masked tiles, got {out}"
+        assert torch.allclose(out, ref, atol=1e-5)
+
 
 # ---------------------------------------------------------------------------
 # 7b. CUDA SM90 TMA kernel backend

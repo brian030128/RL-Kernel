@@ -344,6 +344,31 @@ def test_triton_grpo_gradient_step_reduces_loss():
     assert final.item() < initial.item()
 
 
+@requires_triton_cuda
+def test_triton_group_advantages_non_contiguous_and_large_offset_stability():
+    """group_advantages must handle strided 1-D slices and avoid E[x^2]-E[x]^2 cancellation."""
+    fused = TritonGRPOLossOp()
+
+    # Non-contiguous 1-D float32 slice (stride 2) + non-contiguous int32 bounds.
+    buf = torch.tensor([[1.0, 100.0], [3.0, 200.0], [10.0, 300.0], [30.0, 400.0]], device="cuda")
+    rewards_nc = buf[:, 0]
+    assert not rewards_nc.is_contiguous()
+    bounds_buf = torch.tensor([[0, 99], [2, 88], [4, 77]], device="cuda", dtype=torch.int32)
+    bounds_nc = bounds_buf[:, 0]
+    assert not bounds_nc.is_contiguous()
+
+    adv_nc = fused.group_advantages(rewards_nc, group_boundaries=bounds_nc)
+    expected = torch.tensor([-1.0, 1.0, -1.0, 1.0], device="cuda", dtype=torch.float32)
+    torch.testing.assert_close(adv_nc, expected, atol=1e-5, rtol=1e-5)
+
+    # Large-offset rewards where E[x^2] - E[x]^2 cancels to 0 in FP32.
+    large_rewards = torch.tensor([10000.0, 10001.0], device="cuda", dtype=torch.float32)
+    adv_large = fused.group_advantages(large_rewards, samples_per_prompt=2)
+    torch.testing.assert_close(
+        adv_large, torch.tensor([-1.0, 1.0], device="cuda", dtype=torch.float32), atol=1e-5, rtol=1e-5
+    )
+
+
 # Registry dispatch (device-dependent backend selection)
 def test_registry_dispatches_grpo_loss():
     from rl_engine.runtime.registry import kernel_registry
