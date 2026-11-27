@@ -39,31 +39,33 @@ def _rope_kernel(
     n_rows,
     S,
     SIN_SIGN: tl.constexpr,  # +1.0 forward, -1.0 backward
-    HALF: tl.constexpr,  # D // 2, power-of-two block width
+    HALF: tl.constexpr,  # D // 2 (any positive int)
+    BLOCK_HALF: tl.constexpr,  # next power of two >= HALF
     stride_row,
     stride_d,
 ):
     """One program per row (a single [B, H, S] token vector of width D)."""
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     if row >= n_rows:
         return
 
     # Row layout is [..., S, D] contiguous, so the sequence index is row % S.
     seq_idx = row % S
-    d = tl.arange(0, HALF)
-    cos = tl.load(cos_ptr + seq_idx * HALF + d)
-    sin = tl.load(sin_ptr + seq_idx * HALF + d) * SIN_SIGN
+    d = tl.arange(0, BLOCK_HALF)
+    mask = d < HALF
+    cos = tl.load(cos_ptr + seq_idx * HALF + d, mask=mask, other=0.0)
+    sin = tl.load(sin_ptr + seq_idx * HALF + d, mask=mask, other=0.0) * SIN_SIGN
 
     base = row * stride_row
-    x1 = tl.load(x_ptr + base + d * stride_d).to(tl.float32)
-    x2 = tl.load(x_ptr + base + (d + HALF) * stride_d).to(tl.float32)
+    x1 = tl.load(x_ptr + base + d * stride_d, mask=mask, other=0.0).to(tl.float32)
+    x2 = tl.load(x_ptr + base + (d + HALF) * stride_d, mask=mask, other=0.0).to(tl.float32)
 
     out1 = x1 * cos - x2 * sin
     out2 = x2 * cos + x1 * sin
 
     out_dtype = out_ptr.dtype.element_ty
-    tl.store(out_ptr + base + d * stride_d, out1.to(out_dtype))
-    tl.store(out_ptr + base + (d + HALF) * stride_d, out2.to(out_dtype))
+    tl.store(out_ptr + base + d * stride_d, out1.to(out_dtype), mask=mask)
+    tl.store(out_ptr + base + (d + HALF) * stride_d, out2.to(out_dtype), mask=mask)
 
 
 def _build_cos_sin(positions: Tensor, half: int, theta: float, device: torch.device):
@@ -77,23 +79,27 @@ def _build_cos_sin(positions: Tensor, half: int, theta: float, device: torch.dev
 def _launch_rope(x: Tensor, cos: Tensor, sin: Tensor, S: int, sin_sign: float) -> Tensor:
     D = x.shape[-1]
     half = D // 2
+    block_half = triton.next_power_of_2(half)
     x_2d = x.contiguous().reshape(-1, D)
     n_rows = x_2d.shape[0]
 
     out = torch.empty_like(x_2d)
     grid = (n_rows,)
-    _rope_kernel[grid](
-        x_2d,
-        cos,
-        sin,
-        out,
-        n_rows,
-        S,
-        SIN_SIGN=float(sin_sign),
-        HALF=half,
-        stride_row=x_2d.stride(0),
-        stride_d=x_2d.stride(1),
-    )
+    device_module = torch.get_device_module(x_2d.device)
+    with device_module.device(x_2d.device):
+        _rope_kernel[grid](
+            x_2d,
+            cos,
+            sin,
+            out,
+            n_rows,
+            S,
+            SIN_SIGN=float(sin_sign),
+            HALF=half,
+            BLOCK_HALF=block_half,
+            stride_row=x_2d.stride(0),
+            stride_d=x_2d.stride(1),
+        )
     return out.reshape(x.shape)
 
 
