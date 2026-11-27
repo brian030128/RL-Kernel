@@ -4,18 +4,20 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <float.h>
-#include <iostream>
+#include <math_constants.h>
+#include <stdexcept>
+#include <string>
 
 using nv_bfloat16 = __nv_bfloat16;
 using nv_bfloat162 = __nv_bfloat162;
 
-#define CUDA_CHECK(x)                                                                 \
-  {                                                                                   \
-    auto error = x;                                                                   \
-    if (error != cudaSuccess) {                                                       \
-      std::cerr << "CUDA error - L" << __LINE__ << ": " << cudaGetErrorString(error) << std::endl; \
-      exit(1);                                                                        \
-    }                                                                                 \
+#define CUDA_CHECK(x)                                                                          \
+  {                                                                                            \
+    auto error = x;                                                                            \
+    if (error != cudaSuccess) {                                                                \
+      throw std::runtime_error(std::string("prefix_shared_attention CUDA error - L") +         \
+                               std::to_string(__LINE__) + ": " + cudaGetErrorString(error));   \
+    }                                                                                          \
   }
 
 inline constexpr int WARP_SIZE = 32;
@@ -32,7 +34,8 @@ __device__ inline uint32_t swizzle(uint32_t index) {
 }
 
 template <int HEIGHT, int WIDTH, int TB_SIZE>
-__device__ inline void global_to_shared_swizzle(uint32_t dst, const nv_bfloat16 *src, int src_stride, int tid) {
+__device__ inline void global_to_shared_swizzle(
+    uint32_t dst, const nv_bfloat16 *src, int src_stride, int valid_rows, int tid) {
   constexpr int num_elems = 16 / sizeof(nv_bfloat16);
   constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
 
@@ -41,9 +44,14 @@ __device__ inline void global_to_shared_swizzle(uint32_t dst, const nv_bfloat16 
     const int row = idx / WIDTH;
     const int col = idx % WIDTH;
 
-    const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
-    const nv_bfloat16 *src_addr = src + (row * src_stride + col);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
+    const uint32_t dst_addr =
+        swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
+    if (row < valid_rows) {
+      const nv_bfloat16 *src_addr = src + (static_cast<int64_t>(row) * src_stride + col);
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
+    } else {
+      asm volatile("st.shared.v4.u32 [%0], {0, 0, 0, 0};" :: "r"(dst_addr));
+    }
   }
 }
 
@@ -72,11 +80,12 @@ __device__ inline void mma_m16n8k16(uint32_t A[4], uint32_t B[2], float D[4]) {
 }
 
 template <typename T, typename... Args>
-void launch_kernel(T *kernel, dim3 grid, int block_size, int smem_size, Args... args) {
+void launch_kernel(
+    T *kernel, dim3 grid, int block_size, int smem_size, cudaStream_t stream, Args... args) {
   if (smem_size > 48000) {
     CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   }
-  kernel<<<grid, block_size, smem_size>>>(args...);
+  kernel<<<grid, block_size, smem_size, stream>>>(args...);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -101,11 +110,17 @@ void prefix_shared_attention_kernel(
   const int g_id = blockIdx.y;
   const int bs_id = blockIdx.z;
 
-  Q += (bs_id * G * len_q + g_id * len_q + q_block_id * BLOCK_Q) * DIM;
-  O += (bs_id * G * len_q + g_id * len_q + q_block_id * BLOCK_Q) * DIM;
+  const int q_base = q_block_id * BLOCK_Q;
+  const int valid_q_rows = min(BLOCK_Q, max(0, len_q - q_base));
 
-  K += bs_id * len_kv * DIM;
-  V += bs_id * len_kv * DIM;
+  const int64_t q_offset =
+      ((static_cast<int64_t>(bs_id) * G + g_id) * len_q + q_base) * DIM;
+  Q += q_offset;
+  O += q_offset;
+
+  const int64_t kv_offset = static_cast<int64_t>(bs_id) * len_kv * DIM;
+  K += kv_offset;
+  V += kv_offset;
 
   extern __shared__ nv_bfloat16 smem[];
   const uint32_t Q_smem = __cvta_generic_to_shared(smem);
@@ -128,8 +143,8 @@ void prefix_shared_attention_kernel(
   float rowsumexp[WARP_Q / MMA_M][2] = {};
 
   for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
-    rowmax[mma_id_q][0] = -FLT_MAX;
-    rowmax[mma_id_q][1] = -FLT_MAX;
+    rowmax[mma_id_q][0] = -CUDART_INF_F;
+    rowmax[mma_id_q][1] = -CUDART_INF_F;
   }
 
   uint32_t Q_smem_thread, K_smem_thread, V_smem_thread;
@@ -149,7 +164,7 @@ void prefix_shared_attention_kernel(
     V_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)>(V_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
   }
 
-  global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid);
+  global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, valid_q_rows, tid);
   asm volatile("cp.async.commit_group;");
   asm volatile("cp.async.wait_all;");
   __syncthreads();
@@ -168,17 +183,19 @@ void prefix_shared_attention_kernel(
   auto load_K = [&](int kv_id) {
     if (kv_id < num_kv_iter) {
       const uint32_t dst = K_smem + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(nv_bfloat16));
-      global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(dst, K, DIM, tid);
-      K += BLOCK_KV * DIM;
+      const int valid_kv = min(BLOCK_KV, max(0, len_kv - kv_id * BLOCK_KV));
+      global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(dst, K, DIM, valid_kv, tid);
+      K += static_cast<int64_t>(BLOCK_KV) * DIM;
     }
     asm volatile("cp.async.commit_group;");
   };
 
   auto load_V = [&](int kv_id) {
     if (kv_id < num_kv_iter) {
-        const uint32_t dst = V_smem;
-        global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(dst, V, DIM, tid);
-        V += BLOCK_KV * DIM;
+      const uint32_t dst = V_smem;
+      const int valid_kv = min(BLOCK_KV, max(0, len_kv - kv_id * BLOCK_KV));
+      global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(dst, V, DIM, valid_kv, tid);
+      V += static_cast<int64_t>(BLOCK_KV) * DIM;
     }
     asm volatile("cp.async.commit_group;");
   };
@@ -210,9 +227,14 @@ void prefix_shared_attention_kernel(
     load_K(kv_id + 1);
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
-      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
-        for (int reg_id = 0; reg_id < 4; reg_id++)
-          S_rmem[mma_id_q][mma_id_kv][reg_id] *= softmax_scale;
+      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+        float *regs = S_rmem[mma_id_q][mma_id_kv];
+        const int kv_col = kv_id * BLOCK_KV + mma_id_kv * MMA_N + (lane_id % 4) * 2;
+        regs[0] = (kv_col + 0 < len_kv) ? (regs[0] * softmax_scale) : -CUDART_INF_F;
+        regs[1] = (kv_col + 1 < len_kv) ? (regs[1] * softmax_scale) : -CUDART_INF_F;
+        regs[2] = (kv_col + 0 < len_kv) ? (regs[2] * softmax_scale) : -CUDART_INF_F;
+        regs[3] = (kv_col + 1 < len_kv) ? (regs[3] * softmax_scale) : -CUDART_INF_F;
+      }
 
       float this_rowmax[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
@@ -235,8 +257,8 @@ void prefix_shared_attention_kernel(
       this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
 
       float rescale[2];
-      rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
-      rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+      rescale[0] = (kv_id == 0) ? 0.0f : __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
+      rescale[1] = (kv_id == 0) ? 0.0f : __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
         O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
         O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
@@ -305,17 +327,28 @@ void prefix_shared_attention_kernel(
       regs[2] /= rowsumexp[mma_id_q][1];
       regs[3] /= rowsumexp[mma_id_q][1];
 
-      reinterpret_cast<nv_bfloat162 *>(O + (row + 0) * DIM + col)[0] = __float22bfloat162_rn({regs[0], regs[1]});
-      reinterpret_cast<nv_bfloat162 *>(O + (row + 8) * DIM + col)[0] = __float22bfloat162_rn({regs[2], regs[3]});
+      if (q_base + row < len_q) {
+        reinterpret_cast<nv_bfloat162 *>(O + static_cast<int64_t>(row) * DIM + col)[0] =
+            __float22bfloat162_rn({regs[0], regs[1]});
+      }
+      if (q_base + row + 8 < len_q) {
+        reinterpret_cast<nv_bfloat162 *>(O + static_cast<int64_t>(row + 8) * DIM + col)[0] =
+            __float22bfloat162_rn({regs[2], regs[3]});
+      }
     }
 }
 
 // Host API
 void prefix_shared_attention_forward(
   const __nv_bfloat16 *Q, const __nv_bfloat16 *K, const __nv_bfloat16 *V, __nv_bfloat16 *O,
-  int bs, int G, int len_q, int len_kv, int dim) {
+  int bs, int G, int len_q, int len_kv, int dim, cudaStream_t stream) {
 
-  if (dim != 128) { std::cerr << "Only dim=128 supported." << std::endl; exit(1); }
+  if (dim != 128) {
+    throw std::runtime_error("prefix_shared_attention: only dim=128 is supported");
+  }
+  if (bs <= 0 || G <= 0 || len_q <= 0 || len_kv <= 0) {
+    return;
+  }
 
   const int BLOCK_Q = 64;
   const int BLOCK_KV = 64;
@@ -327,5 +360,5 @@ void prefix_shared_attention_forward(
   const int smem_size = max(BLOCK_Q, BLOCK_KV * 3) * DIM * sizeof(nv_bfloat16);
 
   auto kernel = prefix_shared_attention_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>;
-  launch_kernel(kernel, grid, TB_SIZE, smem_size, Q, K, V, O, bs, G, len_q, len_kv);
+  launch_kernel(kernel, grid, TB_SIZE, smem_size, stream, Q, K, V, O, bs, G, len_q, len_kv);
 }
