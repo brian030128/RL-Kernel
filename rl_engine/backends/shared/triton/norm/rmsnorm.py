@@ -24,7 +24,7 @@ if _TRITON_AVAILABLE:
         EPS: tl.constexpr,
         BLOCK_H: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        row = tl.program_id(0).to(tl.int64)
         offs = tl.arange(0, BLOCK_H)
         mask = offs < H
 
@@ -50,7 +50,7 @@ if _TRITON_AVAILABLE:
         H: tl.constexpr,
         BLOCK_H: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        row = tl.program_id(0).to(tl.int64)
         offs = tl.arange(0, BLOCK_H)
         mask = offs < H
 
@@ -79,6 +79,8 @@ def rmsnorm_triton_forward_with_rstd(x, weight, eps: float = 1e-6):
     assert x.device.type in ("cuda", "hip", "xpu", "musa")
     assert weight.device.type in ("cuda", "hip", "xpu", "musa")
     assert x.dim() == 2 and weight.dim() == 1
+    x = x.contiguous()
+    weight = weight.contiguous()
     rows, hidden = x.shape
     assert weight.numel() == hidden
 
@@ -86,27 +88,35 @@ def rmsnorm_triton_forward_with_rstd(x, weight, eps: float = 1e-6):
     rstd = torch.empty((rows,), device=x.device, dtype=torch.float32)
     block_hidden = triton.next_power_of_2(hidden)
     assert block_hidden <= 131072, "H too large for this simple Triton kernel"
-    _rmsnorm_fwd_kernel[(rows,)](x, weight, output, rstd, rows, hidden, eps, BLOCK_H=block_hidden)
+    device_module = torch.get_device_module(x.device)
+    with device_module.device(x.device):
+        _rmsnorm_fwd_kernel[(rows,)](x, weight, output, rstd, rows, hidden, eps, BLOCK_H=block_hidden)
     return output, rstd
 
 
 def rmsnorm_triton_backward_rows(grad_out, x, weight, rstd):
     _require_triton()
+    grad_out = grad_out.contiguous()
+    x = x.contiguous()
+    weight = weight.contiguous()
+    rstd = rstd.contiguous()
     rows, hidden = x.shape
     dx = torch.empty_like(x)
     partial_dw = torch.empty((rows, hidden), device=x.device, dtype=torch.float32)
     block_hidden = triton.next_power_of_2(hidden)
-    _rmsnorm_bwd_dx_kernel[(rows,)](
-        grad_out,
-        x,
-        weight,
-        rstd,
-        dx,
-        partial_dw,
-        rows,
-        hidden,
-        BLOCK_H=block_hidden,
-    )
+    device_module = torch.get_device_module(x.device)
+    with device_module.device(x.device):
+        _rmsnorm_bwd_dx_kernel[(rows,)](
+            grad_out,
+            x,
+            weight,
+            rstd,
+            dx,
+            partial_dw,
+            rows,
+            hidden,
+            BLOCK_H=block_hidden,
+        )
     return dx, partial_dw
 
 
