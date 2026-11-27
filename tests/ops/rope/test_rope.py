@@ -436,3 +436,27 @@ class TestRoPEAscend:
         out = self._op()(x, positions)
         assert out.shape == x.shape
         assert out.dtype == x.dtype
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton RoPE requires CUDA")
+@pytest.mark.parametrize("head_dim", [48, 80, 96, 192])
+def test_triton_rope_supports_non_power_of_two_even_head_dim(head_dim):
+    """Valid even non-power-of-two head_dim must not crash tl.arange(0, HALF)."""
+    pytest.importorskip("triton")
+    from rl_engine.backends.shared.triton.rope.rope import TritonRoPEOp
+
+    torch.manual_seed(head_dim)
+    x_cpu, pos_cpu = _make_inputs(2, 4, 16, head_dim)
+    x = x_cpu.to(device="cuda", dtype=torch.bfloat16).requires_grad_(True)
+    pos = pos_cpu.to(device="cuda")
+
+    out = TritonRoPEOp()(x, pos, theta=QWEN3_THETA)
+    ref = NativeRoPEOp().forward_fp32(x.detach().float(), pos, theta=QWEN3_THETA)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=1.6e-2)
+
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+
+    x_ref = x.detach().float().requires_grad_(True)
+    NativeRoPEOp().forward_fp32(x_ref, pos, theta=QWEN3_THETA).backward(grad_out.float())
+    torch.testing.assert_close(x.grad.float(), x_ref.grad, atol=2e-2, rtol=1.6e-2)
