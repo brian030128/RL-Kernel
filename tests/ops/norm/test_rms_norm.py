@@ -453,6 +453,39 @@ def test_cuda_rms_norm_masked_dw_layout_invariance():
     torch.testing.assert_close(dw3.float(), ref_dw3.float(), atol=atol, rtol=rtol)
 
 
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_triton_rms_norm_non_contiguous_grad_out_from_sum_backward(dtype):
+    """y.sum().backward() passes a stride-(0, 0) expanded grad_out backed by 1 element."""
+    if not _TRITON_AVAILABLE:
+        pytest.skip("Triton is unavailable")
+
+    torch.manual_seed(42)
+    native = NativeRMSNormOp()
+    x_base = torch.randn((16, 128), device="cuda", dtype=dtype)
+    w_base = torch.randn((128,), device="cuda", dtype=dtype)
+
+    x_ref = x_base.detach().float().requires_grad_(True)
+    w_ref = w_base.detach().float().requires_grad_(True)
+    native.forward_fp32(x_ref, w_ref, eps=_EPS).sum().backward()
+
+    x_tri = x_base.detach().clone().requires_grad_(True)
+    w_tri = w_base.detach().clone().requires_grad_(True)
+    rmsnorm_triton(x_tri, w_tri, eps=_EPS).sum().backward()
+
+    atol, rtol = _dtype_tolerance(dtype)
+    torch.testing.assert_close(x_tri.grad.float(), x_ref.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(w_tri.grad.float(), w_ref.grad, atol=4 * atol, rtol=4 * rtol)
+
+    # Non-contiguous forward inputs (e.g. sliced columns) must also match reference.
+    x_nc_src = torch.randn((16, 256), device="cuda", dtype=dtype)
+    x_nc = x_nc_src[:, ::2]
+    assert not x_nc.is_contiguous()
+    y_nc = rmsnorm_triton(x_nc, w_base, eps=_EPS)
+    y_c = rmsnorm_triton(x_nc.contiguous(), w_base, eps=_EPS)
+    assert torch.equal(y_nc, y_c)
+
+
 # ---------------------------------------------------------------------------
 # Ascend C kernel (rl_engine._C_npu.rmsnorm_ascend)
 # ---------------------------------------------------------------------------
