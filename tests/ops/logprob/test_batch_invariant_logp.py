@@ -1077,6 +1077,93 @@ class TestCudaSM90UnsupportedInputs:
             op(logits, target)
 
 
+@requires_sm90
+class TestCudaSM90Regression:
+    """Regression tests for stream handling, all--inf tiles/tails, and empty batches."""
+
+    def _get_op(self):
+        from rl_engine.backends.cuda.logprob.batch_invariant_logp import BatchInvariantLogpSM90Op
+
+        return BatchInvariantLogpSM90Op()
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_all_neg_inf_tiles_and_tail_no_nan(self, dtype):
+        """All--inf tiles or tails must not produce -inf - (-inf) = NaN in online LSE."""
+        op = self._get_op()
+
+        # Two full 4096-element TMA tiles: row 0 masks tile 0, row 1 masks tile 1.
+        vocab_tiles = 8192
+        logits = torch.randn(2, vocab_tiles, device="cuda", dtype=dtype)
+        logits[0, :4096] = float("-inf")
+        logits[1, 4096:] = float("-inf")
+        target = torch.tensor([5000, 123], device="cuda", dtype=torch.long)
+
+        out = op(logits, target)
+        ref = _reference_logp(logits.float(), target)
+        assert torch.isfinite(out).all(), f"Expected finite logp for masked tiles, got {out}"
+        assert torch.allclose(out, ref, atol=2e-3)
+
+        # TMA tile [0, 4096) + 16-byte-aligned global tail [4096, 4200).
+        vocab_tail = 4200
+        logits_t = torch.randn(2, vocab_tail, device="cuda", dtype=dtype)
+        logits_t[0, :4096] = float("-inf")
+        logits_t[1, 4096:] = float("-inf")
+        target_t = torch.tensor([4120, 77], device="cuda", dtype=torch.long)
+
+        out_t = op(logits_t, target_t)
+        ref_t = _reference_logp(logits_t.float(), target_t)
+        assert torch.isfinite(out_t).all(), f"Expected finite logp for masked tail, got {out_t}"
+        assert torch.allclose(out_t, ref_t, atol=2e-3)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_respects_current_cuda_stream_and_cuda_graph_capture(self, dtype):
+        """Kernel must launch on at::cuda::getCurrentCUDAStream(), not legacy stream 0."""
+        from rl_engine.backends.extension import _C
+
+        torch.manual_seed(17)
+        logits = torch.randn(8, _VC, device="cuda", dtype=dtype)
+        target = torch.randint(0, _VC, (8,), device="cuda", dtype=torch.int32)
+
+        # Warm up on a side stream before CUDA graph capture.
+        side_stream = torch.cuda.Stream()
+        with torch.cuda.stream(side_stream):
+            warm_logp, _ = _C.batch_invariant_logp_sm90(logits, target, -100)
+        side_stream.synchronize()
+        ref0 = _reference_logp(logits.float(), target)
+        assert torch.allclose(warm_logp, ref0, atol=2e-3)
+
+        # Stream capture fails immediately if the kernel launches on legacy stream 0.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side_stream):
+            out_logp, out_lse = _C.batch_invariant_logp_sm90(logits, target, -100)
+
+        new_logits = torch.randn(8, _VC, device="cuda", dtype=dtype)
+        logits.copy_(new_logits)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        ref1 = _reference_logp(new_logits.float(), target)
+        ref1_lse = torch.logsumexp(new_logits.float(), dim=-1)
+        assert torch.allclose(out_logp, ref1, atol=2e-3)
+        assert torch.allclose(out_lse, ref1_lse, atol=2e-3)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_empty_batch(self, dtype):
+        """Empty batch N=0 must return cleanly without invoking TMA descriptor creation."""
+        from rl_engine.backends.extension import _C
+
+        logits = torch.empty(0, _VC, device="cuda", dtype=dtype)
+        target = torch.empty(0, device="cuda", dtype=torch.long)
+
+        logp, lse = _C.batch_invariant_logp_sm90(logits, target, -100)
+        torch.cuda.synchronize()
+        assert logp.shape == (0,) and logp.dtype == torch.float32
+        assert lse.shape == (0,) and lse.dtype == torch.float32
+
+        out = self._get_op()(logits, target)
+        assert out.shape == (0,) and out.dtype == torch.float32
+
+
 # ---------------------------------------------------------------------------
 # 7c. Ascend C kernel backend
 # ---------------------------------------------------------------------------
