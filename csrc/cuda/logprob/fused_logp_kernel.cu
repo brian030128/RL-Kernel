@@ -33,7 +33,7 @@ __device__ __forceinline__ scalar_t blockReduceMax(scalar_t val) {
     if (lane == 0) shared[wid] = f_val;
     __syncthreads();
 
-    f_val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : -1e20f;
+    f_val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : -std::numeric_limits<float>::infinity();
     if (wid == 0) {
         for (int offset = 16; offset > 0; offset /= 2)
             f_val = max(f_val, fused_logp_shfl_down_32(f_val, offset));
@@ -71,10 +71,11 @@ struct LogSumExpState {
 __device__ __forceinline__ LogSumExpState merge_logsumexp_state(
     LogSumExpState a,
     LogSumExpState b) {
-    if (a.sum_exp == 0.0f) {
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    if (a.sum_exp == 0.0f || a.max_val == neg_inf) {
         return b;
     }
-    if (b.sum_exp == 0.0f) {
+    if (b.sum_exp == 0.0f || b.max_val == neg_inf) {
         return a;
     }
 
@@ -107,7 +108,7 @@ __device__ __forceinline__ LogSumExpState blockReduceLogSumExp(LogSumExpState st
     }
     __syncthreads();
 
-    state = { -1e20f, 0.0f };
+    state = { -std::numeric_limits<float>::infinity(), 0.0f };
     if (threadIdx.x < kWarpCount) {
         state = {shared_max[lane], shared_sum[lane]};
     }
@@ -141,7 +142,7 @@ __global__ void fused_logp_forward_kernel(
 
     const scalar_t* row_logits = logits + row * vocab_size;
 
-    float local_max = -1e20f;
+    float local_max = -std::numeric_limits<float>::infinity();
     for (int64_t i = threadIdx.x; i < vocab_size; i += blockDim.x) {
         local_max = max(local_max, static_cast<float>(row_logits[i]));
     }
@@ -205,13 +206,14 @@ __global__ void fused_logp_backward_kernel(
         return;
     }
 
-    float local_max = -1e20f;
+    float local_max = -std::numeric_limits<float>::infinity();
     for (int64_t base = threadIdx.x; base < vocab_size; base += tile) {
         float values[kUnroll];
 #pragma unroll
         for (int u = 0; u < kUnroll; ++u) {
             int64_t i = base + u * stride;
-            values[u] = i < vocab_size ? static_cast<float>(row_logits[i]) : -1e20f;
+            values[u] = i < vocab_size ? static_cast<float>(row_logits[i])
+                                       : -std::numeric_limits<float>::infinity();
         }
 #pragma unroll
         for (int u = 0; u < kUnroll; ++u) {
@@ -285,9 +287,13 @@ __global__ void __launch_bounds__(BlockSize) fused_logp_forward_online_kernel(
 
     const scalar_t* row_logits = logits + row * vocab_size;
 
-    LogSumExpState local_state{-1e20f, 0.0f};
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    LogSumExpState local_state{neg_inf, 0.0f};
     for (int64_t i = threadIdx.x; i < vocab_size; i += BlockSize) {
         float value = static_cast<float>(row_logits[i]);
+        if (value == neg_inf) {
+            continue;
+        }
         if (local_state.sum_exp == 0.0f) {
             local_state = {value, 1.0f};
         } else if (value <= local_state.max_val) {
@@ -571,6 +577,9 @@ torch::Tensor fused_logp_forward_out(
     torch::Tensor token_ids,
     torch::Tensor output) {
     check_fused_logp_inputs(logits, token_ids, output);
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
+    const c10::cuda::CUDAGuard device_guard(logits.device());
+#endif
 
     auto logits_contig = logits.contiguous();
     auto token_ids_contig = token_ids.contiguous();
@@ -596,6 +605,9 @@ torch::Tensor fused_logp_forward_indexed_out(
     torch::Tensor output) {
     check_fused_logp_inputs(logits, token_ids, output);
     check_fused_logp_indices(logits, row_indices);
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
+    const c10::cuda::CUDAGuard device_guard(logits.device());
+#endif
 
     auto logits_contig = logits.contiguous();
     auto token_ids_contig = token_ids.contiguous();
@@ -622,6 +634,9 @@ torch::Tensor fused_logp_forward_online_out(
     torch::Tensor token_ids,
     torch::Tensor output) {
     check_fused_logp_inputs(logits, token_ids, output);
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
+    const c10::cuda::CUDAGuard device_guard(logits.device());
+#endif
 
     auto logits_contig = logits.contiguous();
     auto token_ids_contig = token_ids.contiguous();
@@ -647,6 +662,9 @@ torch::Tensor fused_logp_forward_online_indexed_out(
     torch::Tensor output) {
     check_fused_logp_inputs(logits, token_ids, output);
     check_fused_logp_indices(logits, row_indices);
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
+    const c10::cuda::CUDAGuard device_guard(logits.device());
+#endif
 
     auto logits_contig = logits.contiguous();
     auto token_ids_contig = token_ids.contiguous();

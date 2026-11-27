@@ -17,7 +17,7 @@ constexpr int kDeterministicLogpLargeBlockSize = 512;
 constexpr int kDeterministicLogpSmallVocabLimit = 128;
 constexpr int kDeterministicLogpMediumVocabLimit = 4096;
 constexpr int kDeterministicLogpWarpSize = 32;
-constexpr float kDeterministicLogpNegInf = -3.4028234663852886e38F;
+constexpr float kDeterministicLogpNegInf = -std::numeric_limits<float>::infinity();
 
 template <typename T>
 __device__ __forceinline__ T deterministic_logp_shfl_down_32(T value, unsigned int delta) {
@@ -245,6 +245,7 @@ void launch_deterministic_logp_kernel(
                     using output_t = scalar_t;
                     const int vocab_size_i32 = static_cast<int>(vocab_size);
                     const int launch_rows_i32 = static_cast<int>(launch_rows);
+                    const c10::cuda::CUDAGuard device_guard(logits.device());
                     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
                     if (vocab_size <= kDeterministicLogpSmallVocabLimit) {
@@ -671,6 +672,7 @@ std::vector<torch::Tensor> deterministic_logp_tile_stats(
                 "logits must be float16, bfloat16, or float32");
     TORCH_CHECK(vocab_start >= 0 && real_vocab > 0 && num_tiles > 0,
                 "invalid vocabulary metadata");
+    const c10::cuda::CUDAGuard device_guard(logits.device());
     auto input = logits.contiguous();
     const int64_t rows = input.size(0);
     const int64_t local_vocab = input.size(1);
@@ -717,6 +719,7 @@ torch::Tensor deterministic_logp_backward(
                     logits.scalar_type() == at::ScalarType::Float,
                 "logits must be float16, bfloat16, or float32");
     TORCH_CHECK(vocab_start >= 0 && real_vocab > 0, "invalid vocabulary metadata");
+    const c10::cuda::CUDAGuard device_guard(logits.device());
     auto input = logits.contiguous();
     const int64_t rows = input.size(0);
     const int64_t local_vocab = input.size(1);
