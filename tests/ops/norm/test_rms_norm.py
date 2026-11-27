@@ -453,6 +453,86 @@ def test_cuda_rms_norm_masked_dw_layout_invariance():
     torch.testing.assert_close(dw3.float(), ref_dw3.float(), atol=atol, rtol=rtol)
 
 
+@requires_cuda_rmsnorm
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cuda_rms_norm_zero_dim_inputs(dtype):
+    """Empty batch (T=0) and zero hidden (H=0) must return cleanly without launch errors."""
+    # T = 0, H = 128
+    x0 = torch.empty((0, 128), device="cuda", dtype=dtype)
+    w0 = torch.ones((128,), device="cuda", dtype=dtype)
+    dy0 = torch.empty((0, 128), device="cuda", dtype=dtype)
+    mask0 = torch.empty((0,), device="cuda", dtype=torch.bool)
+
+    y0, rstd0 = _C.rmsnorm_forward(x0, w0, _EPS)
+    torch.cuda.synchronize()
+    assert y0.shape == (0, 128) and y0.dtype == dtype
+    assert rstd0.shape == (0,) and rstd0.dtype == torch.float32
+
+    dx0 = _C.rmsnorm_backward_dx(dy0, x0, w0, rstd0)
+    torch.cuda.synchronize()
+    assert dx0.shape == (0, 128) and dx0.dtype == dtype
+
+    dw0 = _C.rmsnorm_backward_dw(dy0, x0, rstd0, mask0)
+    torch.cuda.synchronize()
+    assert dw0.shape == (128,) and dw0.dtype == torch.float32
+    assert torch.equal(dw0, torch.zeros((128,), device="cuda", dtype=torch.float32))
+
+    # T = 4, H = 0
+    xh = torch.empty((4, 0), device="cuda", dtype=dtype)
+    wh = torch.empty((0,), device="cuda", dtype=dtype)
+    dyh = torch.empty((4, 0), device="cuda", dtype=dtype)
+    maskh = torch.ones((4,), device="cuda", dtype=torch.bool)
+
+    yh, rstdh = _C.rmsnorm_forward(xh, wh, _EPS)
+    dxh = _C.rmsnorm_backward_dx(dyh, xh, wh, rstdh)
+    dwh = _C.rmsnorm_backward_dw(dyh, xh, rstdh, maskh)
+    torch.cuda.synchronize()
+    assert yh.shape == (4, 0)
+    assert dxh.shape == (4, 0)
+    assert dwh.shape == (0,)
+
+
+@requires_cuda_rmsnorm
+def test_cuda_rms_norm_int64_indexing_above_int32_max():
+    """T * H > 2^31 - 1 must not overflow 32-bit row*H indexing into illegal memory access."""
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < 24 * 1024**3:
+        pytest.skip(f"Requires >= 24 GiB free GPU memory (have {free_bytes / 1024**3:.1f} GiB)")
+
+    T, H = 524289, _HIDDEN  # T * H = 2,147,487,744 > INT32_MAX (2,147,483,647)
+    x = weight = dy = mask = y = rstd = dx = dw = None
+    try:
+        x = torch.ones((T, H), device="cuda", dtype=torch.bfloat16)
+        x[-1].fill_(2.0)
+        weight = torch.ones((H,), device="cuda", dtype=torch.bfloat16)
+        dy = torch.ones((T, H), device="cuda", dtype=torch.bfloat16)
+        mask = torch.ones((T,), device="cuda", dtype=torch.bool)
+
+        y, rstd = _C.rmsnorm_forward(x, weight, _EPS)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            y[-1].float(), torch.ones((H,), device="cuda", dtype=torch.float32), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            rstd[-1].item(), 0.5, atol=1e-4, rtol=1e-4
+        )
+
+        dx = _C.rmsnorm_backward_dx(dy, x, weight, rstd)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            dx[-1].float(), torch.zeros((H,), device="cuda", dtype=torch.float32), atol=1e-2, rtol=1e-2
+        )
+
+        dw = _C.rmsnorm_backward_dw(dy, x, rstd, mask)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            dw[0].item(), float(T), atol=5.0, rtol=1e-3
+        )
+    finally:
+        del x, weight, dy, mask, y, rstd, dx, dw
+        torch.cuda.empty_cache()
+
+
 # ---------------------------------------------------------------------------
 # Ascend C kernel (rl_engine._C_npu.rmsnorm_ascend)
 # ---------------------------------------------------------------------------
