@@ -3,6 +3,10 @@
 
 #include <torch/extension.h>
 #include <cuda_bf16.h>
+#if !defined(USE_ROCM) && !defined(KERNEL_ALIGN_WITH_ROCM)
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#endif
 
 // Fused LogP Declarations
 torch::Tensor fused_logp_forward(torch::Tensor logits, torch::Tensor token_ids);
@@ -480,7 +484,8 @@ void prefix_shared_attention_forward(
   int G,
   int len_q,
   int len_kv,
-  int dim);
+  int dim,
+  cudaStream_t stream);
 
 at::Tensor prefix_shared_attention(
   const at::Tensor& Q,
@@ -495,12 +500,20 @@ at::Tensor prefix_shared_attention(
   TORCH_CHECK(Q.is_cuda() && Q.is_contiguous(), "Tensors must be CUDA and contiguous");
   TORCH_CHECK(K.is_cuda() && K.is_contiguous(), "Tensors must be CUDA and contiguous");
   TORCH_CHECK(V.is_cuda() && V.is_contiguous(), "Tensors must be CUDA and contiguous");
+  TORCH_CHECK(K.device() == Q.device() && V.device() == Q.device(),
+              "Q, K, V must be on the same CUDA device");
+
+  const c10::cuda::CUDAGuard device_guard(Q.device());
 
   const int bs = Q.size(0);
   const int G = Q.size(1);
   const int len_q = Q.size(2);
   const int dim = Q.size(3);
   const int len_kv = K.size(1);
+  TORCH_CHECK(dim == 128, "prefix_shared_attention: only dim=128 is supported, got ", dim);
+  TORCH_CHECK(K.size(0) == bs && V.size(0) == bs && V.size(1) == len_kv &&
+              K.size(2) == dim && V.size(2) == dim,
+              "prefix_shared_attention: Q/K/V shape mismatch");
 
   at::Tensor O = at::empty_like(Q);
 
@@ -509,7 +522,8 @@ at::Tensor prefix_shared_attention(
   auto V_ptr = reinterpret_cast<const __nv_bfloat16 *>(V.data_ptr());
   auto O_ptr = reinterpret_cast<__nv_bfloat16 *>(O.data_ptr());
 
-  prefix_shared_attention_forward(Q_ptr, K_ptr, V_ptr, O_ptr, bs, G, len_q, len_kv, dim);
+  prefix_shared_attention_forward(
+      Q_ptr, K_ptr, V_ptr, O_ptr, bs, G, len_q, len_kv, dim, at::cuda::getCurrentCUDAStream());
 
   return O;
 }
